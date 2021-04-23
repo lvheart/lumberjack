@@ -98,6 +98,8 @@ type Logger struct {
 	// deleted.)
 	MaxBackups int `json:"maxbackups" yaml:"maxbackups"`
 
+	BackupPath string `json:"backupPath" yaml:"backupPath"`
+
 	// LocalTime determines if the time used for formatting the timestamps in
 	// backup files is the computer's local time.  The default is to use UTC
 	// time.
@@ -258,6 +260,29 @@ func backupName(name string, local bool) string {
 	return filepath.Join(dir, fmt.Sprintf("%s-%s%s", prefix, timestamp, ext))
 }
 
+func backupPathName(name string, backupPath string, local bool) (string, error) {
+	var dir string
+	if len(backupPath) == 0 {
+		dir = filepath.Dir(name)
+	} else {
+		err := os.MkdirAll(backupPath, 0744)
+		if err != nil {
+			return dir, fmt.Errorf("can't make directories for new logfile: %s", err)
+		}
+		dir = backupPath
+	}
+	filename := filepath.Base(name)
+	ext := filepath.Ext(filename)
+	prefix := filename[:len(filename)-len(ext)]
+	t := currentTime()
+	if !local {
+		t = t.UTC()
+	}
+
+	timestamp := t.Format(backupTimeFormat)
+	return filepath.Join(dir, fmt.Sprintf("%s-%s%s", prefix, timestamp, ext)), nil
+}
+
 // openExistingOrNew opens the logfile if it exists and if the current write
 // would not put it over MaxSize.  If there is no such file or the write would
 // put it over the MaxSize, a new file is created.
@@ -306,9 +331,19 @@ func (l *Logger) millRunOnce() error {
 		return nil
 	}
 
-	files, err := l.oldLogFiles()
+	seperateBackupFolder := l.dir() != l.backupDir()
+
+	files, err := l.oldLogFiles(l.dir(), false)
 	if err != nil {
 		return err
+	}
+
+	if seperateBackupFolder {
+		backupfiles, err := l.oldLogFiles(l.backupDir(), true)
+		if err != nil {
+			return err
+		}
+		files = append(files, backupfiles...)
 	}
 
 	var compress, remove []logInfo
@@ -349,25 +384,62 @@ func (l *Logger) millRunOnce() error {
 	}
 
 	if l.Compress {
+		var remaining []logInfo
 		for _, f := range files {
 			if !strings.HasSuffix(f.Name(), compressSuffix) {
 				compress = append(compress, f)
+			} else {
+				remaining = append(remaining, f)
 			}
 		}
+		files = remaining
 	}
 
+	var dir string
 	for _, f := range remove {
-		errRemove := os.Remove(filepath.Join(l.dir(), f.Name()))
+		if f.backupfolder {
+			dir = l.backupDir()
+		} else {
+			dir = l.dir()
+		}
+		errRemove := os.Remove(filepath.Join(dir, f.Name()))
 		if err == nil && errRemove != nil {
 			err = errRemove
 		}
 	}
+
 	for _, f := range compress {
-		fn := filepath.Join(l.dir(), f.Name())
-		errCompress := compressLogFile(fn, fn+compressSuffix)
+		if f.backupfolder {
+			dir = l.backupDir()
+		} else {
+			dir = l.dir()
+		}
+		srcFn := filepath.Join(dir, f.Name())
+		dstFn := filepath.Join(l.backupDir(), f.Name())
+		errCompress := compressLogFile(srcFn, dstFn+compressSuffix)
 		if err == nil && errCompress != nil {
 			err = errCompress
 		}
+	}
+
+	if seperateBackupFolder {
+		//move
+		for _, f := range files {
+			if f.backupfolder {
+				continue
+			}
+			srcFn := filepath.Join(l.dir(), f.Name())
+			dstFn := filepath.Join(l.backupDir(), f.Name())
+			if err := os.Rename(srcFn, dstFn); err != nil {
+				return fmt.Errorf("can't rename log file: %s", err)
+			}
+
+			// this is a no-op anywhere but linux
+			if err := chown(srcFn, f.FileInfo); err != nil {
+				return err
+			}
+		}
+
 	}
 
 	return err
@@ -397,8 +469,8 @@ func (l *Logger) mill() {
 
 // oldLogFiles returns the list of backup log files stored in the same
 // directory as the current log file, sorted by ModTime
-func (l *Logger) oldLogFiles() ([]logInfo, error) {
-	files, err := ioutil.ReadDir(l.dir())
+func (l *Logger) oldLogFiles(dir string, backupfolder bool) ([]logInfo, error) {
+	files, err := ioutil.ReadDir(dir)
 	if err != nil {
 		return nil, fmt.Errorf("can't read log file directory: %s", err)
 	}
@@ -411,11 +483,11 @@ func (l *Logger) oldLogFiles() ([]logInfo, error) {
 			continue
 		}
 		if t, err := l.timeFromName(f.Name(), prefix, ext); err == nil {
-			logFiles = append(logFiles, logInfo{t, f})
+			logFiles = append(logFiles, logInfo{t, backupfolder, f})
 			continue
 		}
 		if t, err := l.timeFromName(f.Name(), prefix, ext+compressSuffix); err == nil {
-			logFiles = append(logFiles, logInfo{t, f})
+			logFiles = append(logFiles, logInfo{t, backupfolder, f})
 			continue
 		}
 		// error parsing means that the suffix at the end was not generated
@@ -452,6 +524,14 @@ func (l *Logger) max() int64 {
 // dir returns the directory for the current filename.
 func (l *Logger) dir() string {
 	return filepath.Dir(l.filename())
+}
+
+// dir returns the directory for the current filename.
+func (l *Logger) backupDir() string {
+	if len(l.BackupPath) == 0 {
+		return filepath.Dir(l.filename())
+	}
+	return l.BackupPath
 }
 
 // prefixAndExt returns the filename part and extension part from the Logger's
@@ -522,6 +602,7 @@ func compressLogFile(src, dst string) (err error) {
 // timestamp.
 type logInfo struct {
 	timestamp time.Time
+	backupfolder bool
 	os.FileInfo
 }
 
